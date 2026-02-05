@@ -219,31 +219,3 @@ export const execute = (
   const execution: [[number, number], string, string] = [ret, persona.scratch.act_pronunciatio || '', descriptionWithAddress];
   return execution;
 };
-
-/**
- * Main movement function for personas.
- * Determines next action based on perception, planning, and execution.
- */
-export const move = async (
-  persona: Persona,
-  maze: Maze,
-  personas: Record<string, Persona>,
-  curr_tile: [number, number],
-  curr_time: Date
-): Promise<[[number, number], string, string]> => {
-  /**
-   * Note: This is a simplified implementation.
-   * In the full implementation, this would:
-   * 1. Perceive the environment
-   * 2. Retrieve relevant memories
-   * 3. Plan next action
-   * 4. Execute the action using the execute() function above
-   */
-  
-  // For now, return current tile (no movement) with placeholder values
-  const next_tile: [number, number] = curr_tile;
-  const pronunciatio = '😐';
-  const description = 'waiting';
-  
-  return [next_tile, pronunciatio, description];
-};

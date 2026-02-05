@@ -4,6 +4,7 @@
  * Main entry point for Reverie TypeScript backend
  */
 
+import 'dotenv/config';
 import { ReverieServer } from './backend_server/reverie.js';
 import * as fs from 'fs';
 import * as path from 'path';

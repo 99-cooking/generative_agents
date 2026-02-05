@@ -4,6 +4,7 @@
 
 import type { ConceptNode, Persona, Maze } from '../../../types.js';
 import { run_gpt_prompt_event_poignancy, run_gpt_prompt_chat_poignancy } from '../prompt_template/run_gpt_prompt.js';
+import { get_embedding } from '../prompt_template/gpt_structure.js';
 
 const debug = false;
 
@@ -41,13 +42,22 @@ export const perceive = async (
    * take the <att_bandwidth> of the closest events. Finally, we check whether
    * any of them are new, as determined by <retention>. If they are new, then we
    * save those and return the <ConceptNode> instances for those events. 
+   * 
+   * INPUT: 
+   *   persona: An instance of <Persona> that represents the current persona. 
+   *   maze: An instance of <Maze> that represents the current maze in which the 
+   *         persona is acting in. 
+   * OUTPUT: 
+   *   ret_events: a list of <ConceptNode> that are perceived and new. 
    */
 
   // PERCEIVE SPACE
-  // We get the nearby tiles given our current tile and the persona's vision radius.
+  // We get the nearby tiles given our current tile and the persona's vision
+  // radius. 
   const nearby_tiles = maze.get_nearby_tiles(persona.scratch.curr_tile, persona.scratch.vision_r);
 
-  // We then store the perceived space.
+  // We then store the perceived space. Note that the s_mem of the persona is
+  // in the form of a tree constructed using dictionaries. 
   for (const tile_coord of nearby_tiles) {
     const tile = maze.access_tile(tile_coord);
     if (tile.world) {
@@ -72,28 +82,33 @@ export const perceive = async (
     }
   }
 
-  // PERCEIVE EVENTS.
-  // We will perceive events that take place in the same arena as the persona's current arena.
+  // PERCEIVE EVENTS. 
+  // We will perceive events that take place in the same arena as the
+  // persona's current arena. 
   const curr_arena_path = maze.get_tile_path(persona.scratch.curr_tile, 'arena');
   
-  // We do not perceive the same event twice (this can happen if an object is extended across multiple tiles).
+  // We do not perceive the same event twice (this can happen if an object is
+  // extended across multiple tiles).
   const percept_events_set = new Set<string>();
   
-  // We will order our percept based on the distance, with the closest ones getting priorities.
+  // We will order our percept based on the distance, with the closest ones
+  // getting priorities. 
   const percept_events_list: [number, string][] = [];
   
-  // First, we put all events that are occurring in the nearby tiles into the percept_events_list
+  // First, we put all events that are occuring in the nearby tiles into the
+  // percept_events_list
   for (const tile_coord of nearby_tiles) {
     const tile_details = maze.access_tile(tile_coord);
     if (tile_details.events && tile_details.events.size > 0) {
       if (maze.get_tile_path(tile_coord, 'arena') === curr_arena_path) {
-        // Calculate the distance between the persona's current tile, and the target tile.
+        // This calculates the distance between the persona's current tile, 
+        // and the target tile.
         const dist = Math.sqrt(
           Math.pow(tile_coord[0] - persona.scratch.curr_tile[0], 2) +
           Math.pow(tile_coord[1] - persona.scratch.curr_tile[1], 2)
         );
         
-        // Add any relevant events to our temp set/list with the distance info.
+        // Add any relevant events to our temp set/list with the distant info. 
         for (const event_str of tile_details.events) {
           if (!percept_events_set.has(event_str)) {
             percept_events_list.push([dist, event_str]);
@@ -104,47 +119,120 @@ export const perceive = async (
     }
   }
 
-  // We sort, and perceive only persona.scratch.att_bandwidth of the closest events.
+  // We sort, and perceive only persona.scratch.att_bandwidth of the closest
+  // events. If the bandwidth is larger, then it means the persona can perceive
+  // more elements within a small area. 
   percept_events_list.sort((a, b) => a[0] - b[0]);
-  const perceived_events = percept_events_list.slice(0, persona.scratch.att_bandwidth);
+  const perceived_events: string[] = [];
+  for (const [dist, event] of percept_events_list.slice(0, persona.scratch.att_bandwidth)) {
+    perceived_events.push(event);
+  }
 
+  // Storing events. 
+  // <ret_events> is a list of <ConceptNode> instances from the persona's 
+  // associative memory. 
   const ret_events: any[] = [];
   
-  // Process each perceived event
-  for (const [distance, event_str] of perceived_events) {
-    const [event_description, subject, predicate, object] = event_str.split(',').map(s => s.trim());
+  for (const p_event of perceived_events) {
+    // Parse event string: s, p, o, desc
+    let [s, p, o, desc] = p_event.split(',').map((x: string) => x.trim());
     
-    // Check if this event is already in memory within retention period
-    const now = new Date();
-    const retention_time = new Date(now.getTime() - persona.scratch.retention * 60000); // retention in minutes
+    if (!p) {
+      // If the object is not present, then we default the event to "idle".
+      p = "is";
+      o = "idle";
+      desc = "idle";
+    }
     
-    const is_new_event = !persona.a_mem.events.some(event => {
-      if (event.s === subject && event.p === predicate && event.o === object) {
-        return event.created > retention_time;
+    desc = `${s.split(':').pop()} is ${desc}`;
+    
+    // We retrieve the latest persona.scratch.retention events. If there is  
+    // something new that is happening (that is, p_event not in latest_events),
+    // then we add that event to the a_mem and return it. 
+    const latest_events = persona.a_mem.get_summarized_latest_events(persona.scratch.retention);
+    const p_event_tuple: [string, string, string] = [s, p, o];
+    
+    if (!Array.from(latest_events).some(e => e[0] === s && e[1] === p && e[2] === o)) {
+      // We start by managing keywords. 
+      const keywords = new Set<string>();
+      let sub = s;
+      let obj = o;
+      if (s.includes(':')) {
+        sub = s.split(':').pop()!;
       }
-      return false;
-    });
+      if (o.includes(':')) {
+        obj = o.split(':').pop()!;
+      }
+      keywords.add(sub);
+      keywords.add(obj);
 
-    if (is_new_event) {
-      // Calculate poignancy score
-      const poignancy = await generate_poig_score(persona, 'event', event_description);
+      // Get event embedding
+      let desc_embedding_in = desc;
+      if (desc.includes('(')) {
+        desc_embedding_in = desc.split('(')[1].split(')')[0].trim();
+      }
       
-      // Create event node
-      const event_node = {
-        type: 'event',
-        description: event_description,
-        subject,
-        predicate,
-        object,
-        poignancy,
-        distance,
-        created: new Date()
-      };
+      let event_embedding: number[];
+      if (persona.a_mem.embeddings.has(desc_embedding_in)) {
+        event_embedding = persona.a_mem.embeddings.get(desc_embedding_in)!;
+      } else {
+        event_embedding = await get_embedding(desc_embedding_in);
+      }
+      const event_embedding_pair: [string, number[]] = [desc_embedding_in, event_embedding];
       
-      // Add to associative memory
-      persona.a_mem.add_event(subject, predicate, object);
+      // Get event poignancy. 
+      const event_poignancy = await generate_poig_score(persona, 'event', desc_embedding_in);
+
+      // If we observe the persona's self chat, we include that in the memory
+      // of the persona here. 
+      let chat_node_ids: string[] = [];
+      if (s === `${persona.name}` && p === 'chat with') {
+        const curr_event = persona.scratch.act_event;
+        
+        let chat_embedding: number[];
+        if (persona.a_mem.embeddings.has(persona.scratch.act_description)) {
+          chat_embedding = persona.a_mem.embeddings.get(persona.scratch.act_description)!;
+        } else {
+          chat_embedding = await get_embedding(persona.scratch.act_description);
+        }
+        const chat_embedding_pair: [string, number[]] = [persona.scratch.act_description, chat_embedding];
+        
+        const chat_poignancy = await generate_poig_score(persona, 'chat', persona.scratch.act_description);
+        
+        const chat_node = persona.a_mem.add_chat(
+          persona.scratch.curr_time,
+          null,
+          curr_event[0],
+          curr_event[1] || '',
+          curr_event[2] || '',
+          persona.scratch.act_description,
+          keywords,
+          chat_poignancy,
+          chat_embedding_pair,
+          persona.scratch.chat
+        );
+        chat_node_ids = [chat_node.node_id];
+      }
+
+      // Finally, we add the current event to the agent's memory. 
+      const event_node = persona.a_mem.add_event(
+        persona.scratch.curr_time,
+        null,
+        s,
+        p,
+        o,
+        desc,
+        keywords,
+        event_poignancy,
+        event_embedding_pair,
+        chat_node_ids
+      );
       
       ret_events.push(event_node);
+      
+      // Update importance counters for reflection triggering
+      persona.scratch.importance_trigger_curr -= event_poignancy;
+      persona.scratch.importance_ele_n += 1;
     }
   }
 

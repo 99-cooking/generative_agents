@@ -24,14 +24,22 @@ const debug = false;
 export async function generate_focal_points(persona: any, n: number = 3): Promise<string[]> {
   if (debug) console.log("GNS FUNCTION: <generate_focal_points>");
   
-  const nodes = persona.a_mem.seq_event.slice(-100);
-  if (nodes.length === 0) {
-    return ['daily routine'];
+  // Get nodes from both events and thoughts, excluding idle ones
+  const nodes: [Date, any][] = [];
+  for (const node of persona.a_mem.seq_event.concat(persona.a_mem.seq_thought)) {
+    if (!node.embedding_key.includes("idle")) {
+      nodes.push([node.last_accessed, node]);
+    }
   }
+
+  // Sort by last_accessed
+  nodes.sort((a, b) => a[0].getTime() - b[0].getTime());
+  const sortedNodes = nodes.map(([, node]) => node);
   
-  const statements = nodes
-    .map((node: any, count: number) => `${count + 1}. ${node.embedding_key}`)
-    .join("\n");
+  let statements = ""
+  for (const node of sortedNodes.slice(-1 * persona.scratch.importance_ele_n)) {
+    statements += node.embedding_key + "\n";
+  }
   
   const [result] = await run_gpt_prompt_focal_pt(persona, statements, n);
   return result;
@@ -44,18 +52,19 @@ export async function generate_insights_and_evidence(
 ): Promise<Record<string, string[]>> {
   if (debug) console.log("GNS FUNCTION: <generate_insights_and_evidence>");
   
-  const statements = nodes
-    .map((node: any, count: number) => `${count + 1}. ${node.embedding_key}`)
-    .join("\n");
+  let statements = ""
+  for (let count = 0; count < nodes.length; count++) {
+    statements += `${count}. ${nodes[count].embedding_key}\n`;
+  }
   
   const [ret] = await run_gpt_prompt_insight_and_guidance(persona, statements, n);
   
+  console.log(ret);
   try {
     const result: Record<string, string[]> = {};
-    if (Array.isArray(ret)) {
-      for (let i = 0; i < ret.length; i++) {
-        result[ret[i]] = nodes.slice(0, Math.min(3, nodes.length)).map((n: any) => n.node_id);
-      }
+    for (const [thought, evi_raw] of Object.entries(ret)) {
+      const evidence_node_id = ((evi_raw as unknown) as number[]).map((i: number) => nodes[i].node_id);
+      result[thought] = evidence_node_id;
     }
     return result;
   } catch (error) {
@@ -116,65 +125,173 @@ export async function run_reflect(persona: any): Promise<void> {
   /**
    * Run the actual reflection. We generate the focal points, retrieve any 
    * relevant nodes, and generate thoughts and insights.
+   * 
+   * INPUT: 
+   *   persona: Current Persona object
+   * Output: 
+   *   None
    */
   if (debug) console.log("GNS FUNCTION: <run_reflect>");
   
-  // Check importance trigger
-  if (persona.scratch.importance_trigger_curr <= persona.scratch.importance_trigger_max) {
-    return;
-  }
-  persona.scratch.importance_trigger_curr = 0;
-  
-  // Generate focal points
+  // Reflection requires certain focal points. Generate that first. 
   const focal_points = await generate_focal_points(persona, 3);
   
-  for (const focal_pt of focal_points) {
-    // Retrieve related nodes
-    const retrieved = await new_retrieve(persona, [focal_pt], 50);
+  // Retrieve the relevant Nodes object for each of the focal points. 
+  // <retrieved> has keys of focal points, and values of the associated Nodes. 
+  const retrieved = await new_retrieve(persona, focal_points);
+
+  // For each of the focal points, generate thoughts and save it in the 
+  // agent's memory. 
+  for (const [focal_pt, nodes] of Object.entries(retrieved)) {
+    const xx = nodes.map((i: any) => i.embedding_key);
+    for (const xxx of xx) console.log(xxx);
+
+    const thoughts = await generate_insights_and_evidence(persona, nodes as any[], 5);
     
-    // Get relevant nodes
-    let nodes: any[] = [];
-    if (retrieved && typeof retrieved === 'object') {
-      for (const key of Object.keys(retrieved)) {
-        const item = (retrieved as any)[key];
-        if (item && item.events) nodes = nodes.concat(item.events);
-        if (item && item.thoughts) nodes = nodes.concat(item.thoughts);
-      }
-    }
-    
-    if (nodes.length === 0) continue;
-    
-    // Generate insights
-    const insights = await generate_insights_and_evidence(persona, nodes, 2);
-    
-    // Add thoughts to memory
-    for (const [thought, evidence] of Object.entries(insights)) {
-      const created = new Date();
-      const expiration = null;
-      
+    for (const [thought, evidence] of Object.entries(thoughts)) {
+      const created = persona.scratch.curr_time;
+      const expiration = new Date(created.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
       const [s, p, o] = await generate_action_event_triple(thought, persona);
-      const description = thought;
       const keywords = new Set([s, p, o].filter(Boolean));
-      const poignancy = await generate_poig_score(persona, "thought", thought);
-      const embedding = await get_embedding(thought);
-      
+      const thought_poignancy = await generate_poig_score(persona, "thought", thought);
+      const thought_embedding = await get_embedding(thought);
+      const thought_embedding_pair: [string, number[]] = [thought, thought_embedding];
+
       persona.a_mem.add_thought(
         created,
         expiration,
         s, p, o,
-        description,
+        thought,
         keywords,
-        poignancy,
-        [thought, embedding],
-        evidence
+        thought_poignancy,
+        thought_embedding_pair,
+        evidence as string[]
       );
     }
   }
 }
 
-export async function reflection_trigger(persona: any): Promise<void> {
+export function reflection_trigger(persona: any): boolean {
   /**
-   * Check if we should trigger reflection based on accumulated importance.
+   * Given the current persona, determine whether the persona should run a 
+   * reflection. 
+   *  
+   * Our current implementation checks for whether the sum of the new importance
+   * measure has reached the set (hyper-parameter) threshold.
+   * 
+   * INPUT: 
+   *   persona: Current Persona object
+   * Output: 
+   *   True if we are running a new reflection. 
+   *   False otherwise. 
    */
-  await run_reflect(persona);
+  console.log(persona.scratch.name, "persona.scratch.importance_trigger_curr::", persona.scratch.importance_trigger_curr);
+  console.log(persona.scratch.importance_trigger_max);
+
+  if (
+    persona.scratch.importance_trigger_curr <= 0 && 
+    (persona.a_mem.seq_event.length + persona.a_mem.seq_thought.length) > 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function reset_reflection_counter(persona: any): void {
+  /**
+   * We reset the counters used for the reflection trigger. 
+   * 
+   * INPUT: 
+   *   persona: Current Persona object
+   * Output: 
+   *   None
+   */
+  const persona_imt_max = persona.scratch.importance_trigger_max;
+  persona.scratch.importance_trigger_curr = persona_imt_max;
+  persona.scratch.importance_ele_n = 0;
+}
+
+export async function reflect(persona: any): Promise<void> {
+  /**
+   * The main reflection module for the persona. We first check if the trigger 
+   * conditions are met, and if so, run the reflection and reset any of the 
+   * relevant counters. 
+   * 
+   * INPUT: 
+   *   persona: Current Persona object
+   * Output: 
+   *   None
+   */
+  if (reflection_trigger(persona)) {
+    await run_reflect(persona);
+    reset_reflection_counter(persona);
+  }
+
+  // Post-conversation reflection
+  if (persona.scratch.chatting_end_time) {
+    // Check if we're at the conversation end time (within 10 seconds)
+    const curr_time_plus_10s = new Date(persona.scratch.curr_time.getTime() + 10 * 1000);
+    if (
+      curr_time_plus_10s.getTime() === persona.scratch.chatting_end_time.getTime() ||
+      (persona.scratch.curr_time <= persona.scratch.chatting_end_time && 
+       curr_time_plus_10s >= persona.scratch.chatting_end_time)
+    ) {
+      let all_utt = "";
+      if (persona.scratch.chat) {
+        for (const row of persona.scratch.chat) {
+          all_utt += `${row[0]}: ${row[1]}\n`;
+        }
+      }
+
+      // Get evidence from last chat
+      const last_chat = persona.a_mem.get_last_chat(persona.scratch.chatting_with);
+      const evidence = last_chat ? [last_chat.node_id] : [];
+
+      // Generate and add planning thought
+      let planning_thought = await generate_planning_thought_on_convo(persona, all_utt);
+      planning_thought = `For ${persona.scratch.name}'s planning: ${planning_thought}`;
+
+      const created = persona.scratch.curr_time;
+      const expiration = new Date(created.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      const [s, p, o] = await generate_action_event_triple(planning_thought, persona);
+      const keywords = new Set([s, p, o].filter(Boolean));
+      const thought_poignancy = await generate_poig_score(persona, "thought", planning_thought);
+      const thought_embedding = await get_embedding(planning_thought);
+      const thought_embedding_pair: [string, number[]] = [planning_thought, thought_embedding];
+
+      persona.a_mem.add_thought(
+        created,
+        expiration,
+        s, p, o,
+        planning_thought,
+        keywords,
+        thought_poignancy,
+        thought_embedding_pair,
+        evidence
+      );
+
+      // Generate and add memo thought
+      let memo_thought = await generate_memo_on_convo(persona, all_utt);
+      memo_thought = `${persona.scratch.name} ${memo_thought}`;
+
+      const memo_created = persona.scratch.curr_time;
+      const memo_expiration = new Date(memo_created.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+      const [ms, mp, mo] = await generate_action_event_triple(memo_thought, persona);
+      const memo_keywords = new Set([ms, mp, mo].filter(Boolean));
+      const memo_poignancy = await generate_poig_score(persona, "thought", memo_thought);
+      const memo_embedding = await get_embedding(memo_thought);
+      const memo_embedding_pair: [string, number[]] = [memo_thought, memo_embedding];
+
+      persona.a_mem.add_thought(
+        memo_created,
+        memo_expiration,
+        ms, mp, mo,
+        memo_thought,
+        memo_keywords,
+        memo_poignancy,
+        memo_embedding_pair,
+        evidence
+      );
+    }
+  }
 }

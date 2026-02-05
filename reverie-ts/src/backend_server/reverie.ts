@@ -127,6 +127,12 @@ export class ReverieServer {
      * understand the state of the world, calls on each personas to make 
      * decisions based on the world state, and saves their moves at certain step
      * intervals.
+     * 
+     * INPUT
+     *   int_counter: Integer value for the number of steps left for us to take
+     *                in this iteration. 
+     * OUTPUT 
+     *   None
      */
     const sim_folder = path.join(fs_storage, this.sim_code);
 
@@ -140,7 +146,10 @@ export class ReverieServer {
         break;
       }
 
-      // Check for new environment file from frontend
+      // <curr_env_file> file is the file that our frontend outputs. When the
+      // frontend has done its job and moved the personas, then it will put a 
+      // new environment file that matches our step count. That's when we run 
+      // the content of this for loop. Otherwise, we just wait. 
       const curr_env_file = path.join(sim_folder, 'environment', `${this.step}.json`);
       if (check_if_file_exists(curr_env_file)) {
         let env_retrieved = false;
@@ -154,20 +163,26 @@ export class ReverieServer {
         }
 
         if (env_retrieved) {
-          // Clean up all object actions that were used in this cycle.
+          // This is where we go through <game_obj_cleanup> to clean up all 
+          // object actions that were used in this cycle. 
           for (const [key, val] of Object.entries(game_obj_cleanup)) {
+            // We turn all object actions to their blank form (with None). 
             this.maze.turn_event_from_tile_idle(key, val);
           }
           
-          // Initialize game_obj_cleanup for this cycle.
+          // Then we initialize game_obj_cleanup for this cycle. 
           Object.keys(game_obj_cleanup).forEach(key => delete game_obj_cleanup[key]);
 
-          // Move personas in the backend environment to match the frontend environment.
+          // We first move our personas in the backend environment to match 
+          // the frontend environment. 
           for (const [persona_name, persona] of Object.entries(this.personas)) {
+            // <curr_tile> is the tile that the persona was at previously. 
             const curr_tile = this.personas_tile[persona_name];
+            // <new_tile> is the tile that the persona will move to right now,
+            // during this cycle. 
             const new_tile: [number, number] = [new_env[persona_name].x, new_env[persona_name].y];
 
-            // Move the persona on the backend tile map.
+            // We actually move the persona on the backend tile map here. 
             this.personas_tile[persona_name] = new_tile;
             this.maze.remove_subject_events_from_tile(persona.name, curr_tile);
             
@@ -175,19 +190,26 @@ export class ReverieServer {
             const event_str = curr_event.join(',');
             this.maze.add_event_from_tile(curr_event, new_tile);
 
-            // Activate object action when persona arrives at destination.
+            // Now, the persona will travel to get to their destination. *Once*
+            // the persona gets there, we activate the object action.
             if (persona.scratch.planned_path.length === 0) {
+              // We add that new object action event to the backend tile map. 
+              // At its creation, it is stored in the persona's backend. 
               const obj_event = persona.scratch.get_curr_obj_event_and_desc();
               game_obj_cleanup[obj_event.join(',')] = new_tile;
               this.maze.add_event_from_tile(obj_event, new_tile);
               
-              // Remove the temporary blank action for the object.
-              const blank: [string, string, string, string] = [obj_event[0], 'is', 'idle', 'idle'];
+              // We also need to remove the temporary blank action for the 
+              // object that is currently taking the action. 
+              const blank: [string, string | null, string | null, string | null] = [obj_event[0], null, null, null];
               this.maze.remove_event_from_tile(blank, new_tile);
             }
           }
 
-          // Have each persona perceive and move.
+          // Then we need to actually have each of the personas perceive and
+          // move. The movement for each of the personas comes in the form of
+          // x y coordinates where the persona will move towards. e.g., (50, 34)
+          // This is where the core brains of the personas are invoked. 
           const movements: Movement = {
             persona: {},
             meta: {
@@ -196,32 +218,44 @@ export class ReverieServer {
           };
 
           for (const [persona_name, persona] of Object.entries(this.personas)) {
-            // Note: We need to import and call the actual move function
-            // For now, we'll use a placeholder
-            const next_tile: [number, number] = this.personas_tile[persona_name];
-            const pronunciatio = '😐'; // Neutral face emoji as placeholder
-            const description = 'waiting'; // Placeholder
+            // <next_tile> is a x,y coordinate. e.g., (58, 9)
+            // <pronunciatio> is an emoji. e.g., "\ud83d\udca4"
+            // <description> is a string description of the movement. e.g., 
+            //   writing her next novel (editing her novel) 
+            //   @ double studio:double studio:common room:sofa
+            const [next_tile, pronunciatio, description] = await persona.move(
+              this.maze,
+              this.personas,
+              this.personas_tile[persona_name],
+              this.curr_time
+            );
             
             movements.persona[persona_name] = {
               movement: next_tile,
-              pronunciatio,
-              description,
+              pronunciatio: pronunciatio,
+              description: description,
               chat: JSON.stringify(persona.scratch.chat || '')
             };
           }
 
-          // Write movements to file for frontend
+          // We then write the personas' movements to a file that will be sent 
+          // to the frontend server. 
+          // Example json output: 
+          // {"persona": {"Maria Lopez": {"movement": [58, 9]}},
+          //  "persona": {"Klaus Mueller": {"movement": [38, 12]}}, 
+          //  "meta": {curr_time: <datetime>}}
           const curr_move_file = path.join(sim_folder, 'movement', `${this.step}.json`);
           fs.writeFileSync(curr_move_file, JSON.stringify(movements, null, 2));
 
-          // Advance time
+          // After this cycle, the world takes one step forward, and the 
+          // current time moves by <sec_per_step> amount. 
           this.step += 1;
           this.curr_time = new Date(this.curr_time.getTime() + this.sec_per_step * 1000);
           int_counter -= 1;
         }
       }
 
-      // Sleep to prevent CPU overuse
+      // Sleep so we don't burn our machines. 
       await new Promise(resolve => setTimeout(resolve, this.server_sleep * 1000));
     }
   }

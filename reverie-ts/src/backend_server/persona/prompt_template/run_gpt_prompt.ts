@@ -144,7 +144,7 @@ export async function run_gpt_prompt_generate_hourly_schedule(
   test_input: string | null = null,
   verbose: boolean = false
 ): Promise<[string, any]> {
-  const template = readTemplate('hourly_schedule_v2.txt');
+  const template = readTemplate('generate_hourly_schedule_v2.txt');
   const scheduleStr = p_f_ds_hourly_org_or_activity.map(([act, dur]) => `${act} (${dur} min)`).join(', ');
   
   const prompt = generate_prompt([
@@ -182,36 +182,88 @@ export async function run_gpt_prompt_task_decomp(
   verbose: boolean = false
 ): Promise<[[string, number][], any]> {
   const template = readTemplate('task_decomp_v2.txt');
+  
+  // Build the summary string like Python version
+  const currFOrgIndex = persona.scratch.get_f_daily_schedule_hourly_org_index?.() ?? 0;
+  const allIndices: number[] = [currFOrgIndex];
+  
+  const schedule = persona.scratch.f_daily_schedule_hourly_org || [];
+  if (currFOrgIndex + 1 < schedule.length) allIndices.push(currFOrgIndex + 1);
+  if (currFOrgIndex + 2 < schedule.length) allIndices.push(currFOrgIndex + 2);
+  
+  let summStr = `Today is ${persona.scratch.curr_time?.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) || 'today'}. From `;
+  let currTimeRange = '';
+  
+  for (const index of allIndices) {
+    if (index < schedule.length) {
+      let startMin = 0;
+      for (let i = 0; i < index; i++) {
+        startMin += schedule[i][1];
+      }
+      const endMin = startMin + schedule[index][1];
+      
+      const startTime = new Date(0, 0, 0, 0, startMin);
+      const endTime = new Date(0, 0, 0, 0, endMin);
+      
+      const startTimeStr = startTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const endTimeStr = endTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      
+      summStr += `${startTimeStr} ~ ${endTimeStr}, ${persona.name} is planning on ${schedule[index][0]}, `;
+      if (currFOrgIndex + 1 === index) {
+        currTimeRange = `${startTimeStr} ~ ${endTimeStr}`;
+      }
+    }
+  }
+  summStr = summStr.slice(0, -2) + '.';
+  
   const prompt = generate_prompt([
     persona.scratch.get_str_iss(),
-    persona.scratch.get_str_curr_date_str(),
+    summStr,
+    persona.scratch.get_str_firstname(),
     persona.scratch.get_str_firstname(),
     task,
-    String(duration)
+    currTimeRange || String(duration) + ' minutes',
+    String(duration),
+    persona.scratch.get_str_firstname()
   ], template);
 
   const funcValidate = (response: string): boolean => {
-    return response.includes('(') && response.includes(')');
+    return response.includes(')') || response.includes('min');
   };
 
   const funcCleanUp = (response: string): [string, number][] => {
-    // Parse format like "task1 (10 min), task2 (5 min)"
-    const parts = response.split(',');
-    return parts.map(part => {
-      const match = part.match(/(.+?)\s*\((\d+)/);
-      if (match) {
-        return [match[1].trim(), parseInt(match[2])];
+    // Parse format like "1) task (duration in minutes: X, minutes left: Y)"
+    const lines = response.split('\n').filter(line => line.trim());
+    const result: [string, number][] = [];
+    
+    for (const line of lines) {
+      // Try to parse "duration in minutes: X" format
+      const durationMatch = line.match(/duration in minutes:\s*(\d+)/i);
+      if (durationMatch) {
+        // Extract task description - remove number prefix and duration info
+        let taskDesc = line.replace(/^\d+\)\s*/, '').replace(/\s*\(duration.*$/i, '').trim();
+        const dur = parseInt(durationMatch[1]);
+        if (taskDesc && dur > 0) {
+          result.push([taskDesc, dur]);
+        }
+      } else {
+        // Try simpler format: "task (X min)"
+        const simpleMatch = line.match(/(.+?)\s*\((\d+)/);
+        if (simpleMatch) {
+          result.push([simpleMatch[1].trim(), parseInt(simpleMatch[2])]);
+        }
       }
-      return [part.trim(), Math.floor(duration / parts.length)];
-    });
+    }
+    
+    return result.length > 0 ? result : [[task, duration]];
   };
 
   const failSafe: [string, number][] = [[task, duration]];
 
   const output = await ChatGPT_safe_generate_response(
     prompt,
-    "subtask1 (5 min), subtask2 (10 min)",
-    "Output subtasks with durations in parentheses.",
+    "1) task description (duration in minutes: 15, minutes left: 45)",
+    "Output numbered subtasks with duration format shown.",
     3,
     JSON.stringify(failSafe),
     funcValidate,
@@ -233,7 +285,7 @@ export async function run_gpt_prompt_action_sector(
   test_input: string | null = null,
   verbose: boolean = false
 ): Promise<[string, any]> {
-  const template = readTemplate('action_location_v1.txt');
+  const template = readTemplate('action_location_sector_v2.txt');
   const accessibleSectors = persona.s_mem.get_str_accessible_sectors(
     persona.scratch.curr_tile ? maze.access_tile(persona.scratch.curr_tile).world : ''
   );
@@ -404,10 +456,11 @@ export async function run_gpt_prompt_event_triple(
   test_input: string | null = null,
   verbose: boolean = false
 ): Promise<[[string, string, string], any]> {
-  const template = readTemplate('generate_event_v1.txt');
+  const template = readTemplate('generate_event_triple_v1.txt');
   const prompt = generate_prompt([
-    persona.scratch.get_str_firstname(),
-    act_desp
+    persona.name || persona.scratch.get_str_firstname(),
+    act_desp,
+    persona.name || persona.scratch.get_str_firstname()
   ], template);
 
   const funcValidate = (response: string): boolean => {

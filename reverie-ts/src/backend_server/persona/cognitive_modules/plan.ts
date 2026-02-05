@@ -3,7 +3,7 @@
  */
 
 // Type imports
-import type { ConceptNode, Persona, Maze, RetrievedMemory } from '../../../types.js';
+import type { ConceptNode, Persona, Maze, RetrievedMemory, RetrievedContext } from '../../../types.js';
 
 import {
   ChatGPT_safe_generate_response, ChatGPT_single_request,
@@ -565,4 +565,635 @@ export async function _long_term_planning(persona: Persona, new_day: string | bo
   // console.log("Sleeping for 20 seconds...");
   // await new Promise(resolve => setTimeout(resolve, 10000));
   // console.log("Done sleeping!");
+}
+
+export async function _determine_action(persona: Persona, maze: Maze): Promise<void> {
+  /**
+   * Creates the next action sequence for the persona. 
+   * The main goal of this function is to run "add_new_action" on the persona's 
+   * scratch space, which sets up all the action related variables for the next 
+   * action. 
+   * As a part of this, the persona may need to decompose its hourly schedule as 
+   * needed.   
+   * INPUT
+   *   persona: Current <Persona> instance whose action we are determining. 
+   *   maze: Current <Maze> instance. 
+   */
+  function determine_decomp(act_desp: string, act_dura: number): boolean {
+    /**
+     * Given an action description and its duration, we determine whether we need
+     * to decompose it. If the action is about the agent sleeping, we generally
+     * do not want to decompose it, so that's what we catch here. 
+     * INPUT: 
+     *   act_desp: the description of the action (e.g., "sleeping")
+     *   act_dura: the duration of the action in minutes. 
+     * OUTPUT: 
+     *   a boolean. True if we need to decompose, False otherwise. 
+     */
+    if (!act_desp.includes("sleep") && !act_desp.includes("bed")) {
+      return true;
+    } else if (act_desp.includes("sleeping") || act_desp.includes("asleep") || act_desp.includes("in bed")) {
+      return false;
+    } else if (act_desp.includes("sleep") || act_desp.includes("bed")) {
+      if (act_dura > 60) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The goal of this function is to get us the action associated with 
+  // <curr_index>. As a part of this, we may need to decompose some large 
+  // chunk actions. 
+  // Importantly, we try to decompose at least two hours worth of schedule at
+  // any given point. 
+  const curr_index = persona.scratch.get_f_daily_schedule_index();
+  const curr_index_60 = persona.scratch.get_f_daily_schedule_index(60);
+
+  // * Decompose * 
+  // During the first hour of the day, we need to decompose two hours 
+  // sequence. We do that here. 
+  if (curr_index === 0) {
+    // This portion is invoked if it is the first hour of the day. 
+    let [act_desp, act_dura] = persona.scratch.f_daily_schedule[curr_index];
+    if (act_dura >= 60) {
+      // We decompose if the next action is longer than an hour, and fits the
+      // criteria described in determine_decomp.
+      if (determine_decomp(act_desp, act_dura)) {
+        const decomp = await generate_task_decomp(persona, act_desp, act_dura);
+        persona.scratch.f_daily_schedule.splice(curr_index, 1, ...decomp);
+      }
+    }
+    if (curr_index_60 + 1 < persona.scratch.f_daily_schedule.length) {
+      [act_desp, act_dura] = persona.scratch.f_daily_schedule[curr_index_60 + 1];
+      if (act_dura >= 60) {
+        if (determine_decomp(act_desp, act_dura)) {
+          const decomp = await generate_task_decomp(persona, act_desp, act_dura);
+          persona.scratch.f_daily_schedule.splice(curr_index_60 + 1, 1, ...decomp);
+        }
+      }
+    }
+  }
+
+  if (curr_index_60 < persona.scratch.f_daily_schedule.length) {
+    // If it is not the first hour of the day, this is always invoked (it is
+    // also invoked during the first hour of the day -- to double up so we can
+    // decompose two hours in one go). Of course, we need to have something to
+    // decompose as well, so we check for that too. 
+    if (persona.scratch.curr_time.getHours() < 23) {
+      // And we don't want to decompose after 11 pm. 
+      const [act_desp, act_dura] = persona.scratch.f_daily_schedule[curr_index_60];
+      if (act_dura >= 60) {
+        if (determine_decomp(act_desp, act_dura)) {
+          const decomp = await generate_task_decomp(persona, act_desp, act_dura);
+          persona.scratch.f_daily_schedule.splice(curr_index_60, 1, ...decomp);
+        }
+      }
+    }
+  }
+  // * End of Decompose * 
+
+  // Generate an <Action> instance from the action description and duration. By
+  // this point, we assume that all the relevant actions are decomposed and 
+  // ready in f_daily_schedule. 
+  console.log("DEBUG LJSDLFSKJF");
+  for (const i of persona.scratch.f_daily_schedule) console.log(i);
+  console.log(curr_index);
+  console.log(persona.scratch.f_daily_schedule.length);
+  console.log(persona.scratch.name);
+  console.log("------");
+
+  // 1440
+  let x_emergency = 0;
+  for (const [, dur] of persona.scratch.f_daily_schedule) {
+    x_emergency += dur;
+  }
+  // console.log("x_emergency", x_emergency);
+
+  if (1440 - x_emergency > 0) {
+    console.log("x_emergency__AAA", x_emergency);
+  }
+  persona.scratch.f_daily_schedule.push(["sleeping", 1440 - x_emergency]);
+
+  const [act_desp, act_dura] = persona.scratch.f_daily_schedule[curr_index];
+
+  // Finding the target location of the action and creating action-related
+  // variables.
+  console.log(`[PLAN] ${persona.scratch.name}: Determining action for "${act_desp}" (${act_dura} min)`);
+  
+  const act_world = maze.access_tile(persona.scratch.curr_tile)["world"];
+  console.log(`[PLAN] ${persona.scratch.name}: act_world = ${act_world}`);
+  
+  // act_sector = maze.access_tile(persona.scratch.curr_tile)["sector"];
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_sector...`);
+  const act_sector = await generate_action_sector(act_desp, persona, maze);
+  console.log(`[PLAN] ${persona.scratch.name}: act_sector = ${act_sector}`);
+  
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_arena...`);
+  const act_arena = await generate_action_arena(act_desp, persona, maze, act_world, act_sector);
+  console.log(`[PLAN] ${persona.scratch.name}: act_arena = ${act_arena}`);
+  
+  const act_address = `${act_world}:${act_sector}:${act_arena}`;
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_game_object for ${act_address}...`);
+  const act_game_object = await generate_action_game_object(act_desp, act_address, persona, maze);
+  console.log(`[PLAN] ${persona.scratch.name}: act_game_object = ${act_game_object}`);
+  
+  const new_address = `${act_world}:${act_sector}:${act_arena}:${act_game_object}`;
+  console.log(`[PLAN] ${persona.scratch.name}: new_address = ${new_address}`);
+  
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_pronunciatio...`);
+  const act_pron = await generate_action_pronunciatio(act_desp, persona);
+  console.log(`[PLAN] ${persona.scratch.name}: act_pron = ${act_pron}`);
+  
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_event_triple...`);
+  const act_event = await generate_action_event_triple(act_desp, persona);
+  console.log(`[PLAN] ${persona.scratch.name}: act_event = ${JSON.stringify(act_event)}`);
+  
+  // Persona's actions also influence the object states. We set those up here. 
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_act_obj_desc...`);
+  const act_obj_desp = await generate_act_obj_desc(act_game_object, act_desp, persona);
+  console.log(`[PLAN] ${persona.scratch.name}: act_obj_desp = ${act_obj_desp}`);
+  
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_action_pronunciatio for obj...`);
+  const act_obj_pron = await generate_action_pronunciatio(act_obj_desp, persona);
+  console.log(`[PLAN] ${persona.scratch.name}: act_obj_pron = ${act_obj_pron}`);
+  
+  console.log(`[PLAN] ${persona.scratch.name}: Calling generate_act_obj_event_triple...`);
+  const act_obj_event = await generate_act_obj_event_triple(act_game_object, act_obj_desp, persona);
+  console.log(`[PLAN] ${persona.scratch.name}: act_obj_event = ${JSON.stringify(act_obj_event)}`);
+
+  // Adding the action to persona's queue. 
+  persona.scratch.add_new_action(
+    new_address,
+    Math.floor(act_dura),
+    act_desp,
+    act_pron,
+    act_event,
+    null,
+    null,
+    null,
+    null,
+    act_obj_desp,
+    act_obj_pron,
+    act_obj_event
+  );
+}
+
+export function _choose_retrieved(persona: Persona, retrieved: RetrievedMemory): RetrievedContext | null {
+  /**
+   * Retrieved elements have multiple core "curr_events". We need to choose one
+   * event to which we are going to react to. We pick that event here. 
+   * INPUT
+   *   persona: Current <Persona> instance whose action we are determining. 
+   *   retrieved: A dictionary of <ConceptNode> that were retrieved from the 
+   *              the persona's associative memory. This dictionary takes the
+   *              following form: 
+   *              dictionary[event.description] = 
+   *                {["curr_event"] = <ConceptNode>, 
+   *                 ["events"] = [<ConceptNode>, ...], 
+   *                 ["thoughts"] = [<ConceptNode>, ...] }
+   */
+  // Once we are done with the reflection, we might want to build a more  
+  // complex structure here.
+
+  // We do not want to take self events... for now 
+  const copy_retrieved = { ...retrieved };
+  for (const [event_desc, rel_ctx] of Object.entries(copy_retrieved)) {
+    const curr_event = rel_ctx.curr_event;
+    if (curr_event.subject === persona.name) {
+      delete retrieved[event_desc];
+    }
+  }
+
+  // Always choose persona first.
+  const priority: RetrievedContext[] = [];
+  for (const [event_desc, rel_ctx] of Object.entries(retrieved)) {
+    const curr_event = rel_ctx.curr_event;
+    if (!curr_event.subject.includes(":") && curr_event.subject !== persona.name) {
+      priority.push(rel_ctx);
+    }
+  }
+  if (priority.length > 0) {
+    return priority[Math.floor(Math.random() * priority.length)];
+  }
+
+  // Skip idle. 
+  for (const [event_desc, rel_ctx] of Object.entries(retrieved)) {
+    const curr_event = rel_ctx.curr_event;
+    if (!event_desc.includes("is idle")) {
+      priority.push(rel_ctx);
+    }
+  }
+  if (priority.length > 0) {
+    return priority[Math.floor(Math.random() * priority.length)];
+  }
+  return null;
+}
+
+export async function _should_react(
+  persona: Persona,
+  retrieved: RetrievedContext,
+  personas: Record<string, Persona>
+): Promise<string | false> {
+  /**
+   * Determines what form of reaction the persona should exihibit given the 
+   * retrieved values. 
+   * INPUT
+   *   persona: Current <Persona> instance whose action we are determining. 
+   *   retrieved: A dictionary of <ConceptNode> that were retrieved from the 
+   *              the persona's associative memory. This dictionary takes the
+   *              following form: 
+   *              dictionary[event.description] = 
+   *                {["curr_event"] = <ConceptNode>, 
+   *                 ["events"] = [<ConceptNode>, ...], 
+   *                 ["thoughts"] = [<ConceptNode>, ...] }
+   *   personas: A dictionary that contains all persona names as keys, and the 
+   *             <Persona> instance as values. 
+   */
+  async function lets_talk(init_persona: Persona, target_persona: Persona, retrieved: RetrievedContext): Promise<boolean> {
+    if (!target_persona.scratch.act_address
+      || !target_persona.scratch.act_description
+      || !init_persona.scratch.act_address
+      || !init_persona.scratch.act_description) {
+      return false;
+    }
+
+    if (target_persona.scratch.act_description.includes("sleeping")
+      || init_persona.scratch.act_description.includes("sleeping")) {
+      return false;
+    }
+
+    if (init_persona.scratch.curr_time.getHours() === 23) {
+      return false;
+    }
+
+    if (init_persona.scratch.act_address.includes("<waiting>")) {
+      return false;
+    }
+
+    if (target_persona.scratch.chatting_with
+      || init_persona.scratch.chatting_with) {
+      return false;
+    }
+
+    if (target_persona.name in init_persona.scratch.chatting_with_buffer) {
+      if (init_persona.scratch.chatting_with_buffer[target_persona.name] > 0) {
+        return false;
+      }
+    }
+
+    // Wrap RetrievedContext into RetrievedMemory for the function call
+    const retrieved_memory: RetrievedMemory = { [retrieved.curr_event.description]: retrieved };
+    if (await generate_decide_to_talk(init_persona, target_persona, retrieved_memory)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async function lets_react(init_persona: Persona, target_persona: Persona, retrieved: RetrievedContext): Promise<string | false> {
+    if (!target_persona.scratch.act_address
+      || !target_persona.scratch.act_description
+      || !init_persona.scratch.act_address
+      || !init_persona.scratch.act_description) {
+      return false;
+    }
+
+    if (target_persona.scratch.act_description.includes("sleeping")
+      || init_persona.scratch.act_description.includes("sleeping")) {
+      return false;
+    }
+
+    // return false
+    if (init_persona.scratch.curr_time.getHours() === 23) {
+      return false;
+    }
+
+    if (target_persona.scratch.act_description.includes("waiting")) {
+      return false;
+    }
+    if (init_persona.scratch.planned_path.length === 0) {
+      return false;
+    }
+
+    if (init_persona.scratch.act_address !== target_persona.scratch.act_address) {
+      return false;
+    }
+
+    // Wrap RetrievedContext into RetrievedMemory for the function call
+    const retrieved_memory: RetrievedMemory = { [retrieved.curr_event.description]: retrieved };
+    const react_mode = await generate_decide_to_react(init_persona, target_persona, retrieved_memory);
+
+    if (react_mode === "1") {
+      const wait_until = new Date(target_persona.scratch.act_start_time.getTime()
+        + (target_persona.scratch.act_duration - 1) * 60000);
+      const wait_until_str = wait_until.toLocaleString('en-US', { month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).replace(/,\s*/g, ', ');
+      return `wait: ${wait_until_str}`;
+    } else if (react_mode === "2") {
+      return false;
+      // return "do other things";
+    } else {
+      return false;
+      // return "keep";
+    }
+  }
+
+  // If the persona is chatting right now, default to no reaction 
+  if (persona.scratch.chatting_with) {
+    return false;
+  }
+  if (persona.scratch.act_address.includes("<waiting>")) {
+    return false;
+  }
+
+  // Recall that retrieved takes the following form: 
+  // dictionary {["curr_event"] = <ConceptNode>, 
+  //             ["events"] = [<ConceptNode>, ...], 
+  //             ["thoughts"] = [<ConceptNode>, ...]}
+  const curr_event = retrieved.curr_event;
+
+  if (!curr_event.subject.includes(":")) {
+    // this is a persona event. 
+    if (await lets_talk(persona, personas[curr_event.subject], retrieved)) {
+      return `chat with ${curr_event.subject}`;
+    }
+    const react_mode = await lets_react(persona, personas[curr_event.subject], retrieved);
+    return react_mode;
+  }
+  return false;
+}
+
+export async function _create_react(
+  persona: Persona,
+  inserted_act: string,
+  inserted_act_dur: number,
+  act_address: string,
+  act_event: [string, string, string],
+  chatting_with: string | null,
+  chat: [string, string][] | null,
+  chatting_with_buffer: Record<string, number> | null,
+  chatting_end_time: Date | null,
+  act_pronunciatio: string,
+  act_obj_description: string | null,
+  act_obj_pronunciatio: string | null,
+  act_obj_event: [string | null, string | null, string | null],
+  act_start_time?: Date
+): Promise<void> {
+  const p = persona;
+
+  let min_sum = 0;
+  for (let i = 0; i < p.scratch.get_f_daily_schedule_hourly_org_index(); i++) {
+    min_sum += p.scratch.f_daily_schedule_hourly_org[i][1];
+  }
+  const start_hour = Math.floor(min_sum / 60);
+
+  let end_hour: number;
+  if (p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index()][1] >= 120) {
+    end_hour = start_hour + p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index()][1] / 60;
+  } else if (p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index()][1]
+    + p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index() + 1]?.[1]) {
+    end_hour = start_hour + ((p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index()][1]
+      + p.scratch.f_daily_schedule_hourly_org[p.scratch.get_f_daily_schedule_hourly_org_index() + 1][1]) / 60);
+  } else {
+    end_hour = start_hour + 2;
+  }
+  end_hour = Math.floor(end_hour);
+
+  let dur_sum = 0;
+  let count = 0;
+  let start_index: number | null = null;
+  let end_index: number | null = null;
+  for (const [act, dur] of p.scratch.f_daily_schedule) {
+    if (dur_sum >= start_hour * 60 && start_index === null) {
+      start_index = count;
+    }
+    if (dur_sum >= end_hour * 60 && end_index === null) {
+      end_index = count;
+    }
+    dur_sum += dur;
+    count += 1;
+  }
+
+  const ret = await generate_new_decomp_schedule(p, inserted_act, inserted_act_dur, start_hour, end_hour);
+  if (start_index !== null && end_index !== null) {
+    p.scratch.f_daily_schedule.splice(start_index, end_index - start_index, ...ret);
+  }
+  p.scratch.add_new_action(
+    act_address,
+    inserted_act_dur,
+    inserted_act,
+    act_pronunciatio,
+    act_event,
+    chatting_with,
+    chat,
+    chatting_with_buffer,
+    chatting_end_time,
+    act_obj_description,
+    act_obj_pronunciatio,
+    act_obj_event,
+    act_start_time
+  );
+}
+
+export async function _chat_react(
+  maze: Maze,
+  persona: Persona,
+  focused_event: RetrievedContext,
+  reaction_mode: string,
+  personas: Record<string, Persona>
+): Promise<void> {
+  // There are two personas -- the persona who is initiating the conversation
+  // and the persona who is the target. We get the persona instances here. 
+  const init_persona = persona;
+  const target_persona = personas[reaction_mode.slice(9).trim()];
+  const curr_personas = [init_persona, target_persona];
+
+  // Actually creating the conversation here. 
+  const [convo, duration_min] = await generate_convo(maze, init_persona, target_persona);
+  const convo_summary = await generate_convo_summary(init_persona, convo);
+  const inserted_act = convo_summary;
+  const inserted_act_dur = duration_min;
+
+  const act_start_time = target_persona.scratch.act_start_time;
+
+  const curr_time = target_persona.scratch.curr_time;
+  let chatting_end_time: Date;
+  if (curr_time.getSeconds() !== 0) {
+    const temp_curr_time = new Date(curr_time.getTime() + (60 - curr_time.getSeconds()) * 1000);
+    chatting_end_time = new Date(temp_curr_time.getTime() + inserted_act_dur * 60000);
+  } else {
+    chatting_end_time = new Date(curr_time.getTime() + inserted_act_dur * 60000);
+  }
+
+  for (const [role, p] of [["init", init_persona], ["target", target_persona]] as [string, Persona][]) {
+    let act_address: string;
+    let act_event: [string, string, string];
+    let chatting_with: string;
+    let chatting_with_buffer: Record<string, number>;
+
+    if (role === "init") {
+      act_address = `<persona> ${target_persona.name}`;
+      act_event = [p.name, "chat with", target_persona.name];
+      chatting_with = target_persona.name;
+      chatting_with_buffer = {};
+      chatting_with_buffer[target_persona.name] = 800;
+    } else {
+      act_address = `<persona> ${init_persona.name}`;
+      act_event = [p.name, "chat with", init_persona.name];
+      chatting_with = init_persona.name;
+      chatting_with_buffer = {};
+      chatting_with_buffer[init_persona.name] = 800;
+    }
+
+    const act_pronunciatio = "💬";
+    const act_obj_description: string | null = null;
+    const act_obj_pronunciatio: string | null = null;
+    const act_obj_event: [string | null, string | null, string | null] = [null, null, null];
+
+    await _create_react(
+      p,
+      inserted_act,
+      inserted_act_dur,
+      act_address,
+      act_event,
+      chatting_with,
+      convo,
+      chatting_with_buffer,
+      chatting_end_time,
+      act_pronunciatio,
+      act_obj_description,
+      act_obj_pronunciatio,
+      act_obj_event,
+      act_start_time
+    );
+  }
+}
+
+export async function _wait_react(persona: Persona, reaction_mode: string): Promise<void> {
+  const p = persona;
+
+  const inserted_act = `waiting to start ${p.scratch.act_description.split("(")[p.scratch.act_description.split("(").length - 1].slice(0, -1)}`;
+  const end_time = new Date(reaction_mode.slice(6).trim());
+  const inserted_act_dur = (end_time.getMinutes() + end_time.getHours() * 60) - (p.scratch.curr_time.getMinutes() + p.scratch.curr_time.getHours() * 60) + 1;
+
+  const act_address = `<waiting> ${p.scratch.curr_tile[0]} ${p.scratch.curr_tile[1]}`;
+  const act_event: [string, string, string] = [p.name, "waiting to start", p.scratch.act_description.split("(")[p.scratch.act_description.split("(").length - 1].slice(0, -1)];
+  const chatting_with: string | null = null;
+  const chat: [string, string][] | null = null;
+  const chatting_with_buffer: Record<string, number> | null = null;
+  const chatting_end_time: Date | null = null;
+
+  const act_pronunciatio = "⌛";
+  const act_obj_description: string | null = null;
+  const act_obj_pronunciatio: string | null = null;
+  const act_obj_event: [string | null, string | null, string | null] = [null, null, null];
+
+  await _create_react(
+    p,
+    inserted_act,
+    inserted_act_dur,
+    act_address,
+    act_event,
+    chatting_with,
+    chat,
+    chatting_with_buffer,
+    chatting_end_time,
+    act_pronunciatio,
+    act_obj_description,
+    act_obj_pronunciatio,
+    act_obj_event
+  );
+}
+
+export async function plan(
+  persona: Persona,
+  maze: Maze,
+  personas: Record<string, Persona>,
+  new_day: string | false,
+  retrieved: RetrievedMemory
+): Promise<string> {
+  /**
+   * Main cognitive function of the chain. It takes the retrieved memory and 
+   * perception, as well as the maze and the first day state to conduct both 
+   * the long term and short term planning for the persona. 
+   * INPUT: 
+   *   maze: Current <Maze> instance of the world. 
+   *   personas: A dictionary that contains all persona names as keys, and the 
+   *             Persona instance as values. 
+   *   new_day: This can take one of the three values. 
+   *     1) <Boolean> False -- It is not a "new day" cycle (if it is, we would
+   *        need to call the long term planning sequence for the persona). 
+   *     2) <String> "First day" -- It is literally the start of a simulation,
+   *        so not only is it a new day, but also it is the first day. 
+   *     2) <String> "New day" -- It is a new day. 
+   *   retrieved: dictionary of dictionary. The first layer specifies an event,
+   *              while the latter layer specifies the "curr_event", "events", 
+   *              and "thoughts" that are relevant.
+   * OUTPUT 
+   *   The target action address of the persona (persona.scratch.act_address).
+   */
+  // PART 1: Generate the hourly schedule. 
+  if (new_day) {
+    await _long_term_planning(persona, new_day);
+  }
+
+  // PART 2: If the current action has expired, we want to create a new plan.
+  if (persona.scratch.act_check_finished()) {
+    await _determine_action(persona, maze);
+  }
+
+  // PART 3: If you perceived an event that needs to be responded to (saw 
+  // another persona), and retrieved relevant information. 
+  // Step 1: Retrieved may have multiple events represented in it. The first 
+  //         job here is to determine which of the events we want to focus 
+  //         on for the persona. 
+  //         <focused_event> takes the form of a dictionary like this: 
+  //         dictionary {["curr_event"] = <ConceptNode>, 
+  //                     ["events"] = [<ConceptNode>, ...], 
+  //                     ["thoughts"] = [<ConceptNode>, ...]}
+  let focused_event: RetrievedContext | false = false;
+  if (Object.keys(retrieved).length > 0) {
+    focused_event = _choose_retrieved(persona, retrieved);
+  }
+
+  // Step 2: Once we choose an event, we need to determine whether the
+  //         persona will take any actions for the perceived event. There are
+  //         three possible modes of reaction returned by _should_react. 
+  //         a) "chat with {target_persona.name}"
+  //         b) "react"
+  //         c) False
+  if (focused_event) {
+    const reaction_mode = await _should_react(persona, focused_event, personas);
+    if (reaction_mode) {
+      // If we do want to chat, then we generate conversation 
+      if (reaction_mode.slice(0, 9) === "chat with") {
+        await _chat_react(maze, persona, focused_event, reaction_mode, personas);
+      } else if (reaction_mode.slice(0, 4) === "wait") {
+        await _wait_react(persona, reaction_mode);
+      }
+      // elif reaction_mode == "do other things": 
+      //   _chat_react(persona, focused_event, reaction_mode, personas)
+    }
+  }
+
+  // Step 3: Chat-related state clean up. 
+  // If the persona is not chatting with anyone, we clean up any of the 
+  // chat-related states here. 
+  if (persona.scratch.act_event[1] !== "chat with") {
+    persona.scratch.chatting_with = null;
+    persona.scratch.chat = null;
+    persona.scratch.chatting_end_time = null;
+  }
+  // We want to make sure that the persona does not keep conversing with each
+  // other in an infinite loop. So, chatting_with_buffer maintains a form of 
+  // buffer that makes the persona wait from talking to the same target 
+  // immediately after chatting once. We keep track of the buffer value here. 
+  const curr_persona_chat_buffer = persona.scratch.chatting_with_buffer;
+  for (const [persona_name, buffer_count] of Object.entries(curr_persona_chat_buffer)) {
+    if (persona_name !== persona.scratch.chatting_with) {
+      persona.scratch.chatting_with_buffer[persona_name] -= 1;
+    }
+  }
+
+  return persona.scratch.act_address;
 }
